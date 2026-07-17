@@ -57,7 +57,7 @@ python server/api.py
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer wsh101007" \
+  -H "Authorization: Bearer $LLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"minicpm1","messages":[{"role":"user","content":"你好！"}],"max_tokens":64}'
 ```
@@ -66,7 +66,7 @@ Python OpenAI 客户端:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://192.168.1.199:8000/v1", api_key="wsh101007")
+client = OpenAI(base_url="http://<your-server>:8000/v1", api_key=os.environ["LLM_API_KEY"])
 resp = client.chat.completions.create(
     model="minicpm1",
     messages=[{"role": "user", "content": "Hello!"}]

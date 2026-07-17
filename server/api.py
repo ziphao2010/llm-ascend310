@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 log = logging.getLogger("minicpm")
 
 MP = "/root/models/MiniCPM5-1B"
-API_KEY = os.environ.get("LLM_API_KEY", "wsh101007")
+API_KEY = os.environ.get("LLM_API_KEY")
 MAX_CTX = int(os.environ.get("LLM_MAX_CONTEXT", "32768"))
 H, QD, KD, IM, NH, NKV, HD, VS = 1536, 2048, 256, 4608, 16, 2, 128, 130560
 

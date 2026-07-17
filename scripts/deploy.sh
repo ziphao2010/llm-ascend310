@@ -17,7 +17,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/7.0.0/lib64:\
 /usr/local/Ascend/driver/lib64:\
 /usr/local/Ascend/driver/lib64/common:\
 /usr/local/Ascend/driver/lib64/driver
-export LLM_API_KEY=${LLM_API_KEY:-llm101007}
+export LLM_API_KEY=${LLM_API_KEY:?Must set LLM_API_KEY}
 export LLM_MODEL_PATH=$MODEL_PATH
 export LLM_MAX_CONTEXT=${LLM_MAX_CONTEXT:-131072}
 export LLM_INSTANCES=${LLM_INSTANCES:-4}
