@@ -157,18 +157,27 @@ resp = client.chat.completions.create(
     max_tokens=64,
 )
 print(resp.choices[0].message.content)
-
-# Streaming
-stream = client.chat.completions.create(
-    model="minicpm2",  # 使用第二个实例
-    messages=[{"role": "user", "content": "讲个笑话"}],
-    max_tokens=128,
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
 ```
+
+## Codex / 第三方客户端配置
+
+| 字段 | 值 |
+|:----|:-----|
+| API 地址 | `http://192.168.1.199:8000/v1` |
+| 模型 ID | `minicpm1`（或 minicpm2/3/4） |
+| API Key | ❗**必须设置 `LLM_API_KEY` 环境变量** |
+| 跨域 | CORS ✅ 全开 |
+
+### 兼容性清单
+
+| 特性 | 状态 |
+|:----|:----:|
+| OpenAI 格式 | ✅ |
+| Auth (Bearer) | ✅ |
+| Streaming (SSE) | ✅ |
+| CORS 预检 | ✅ |
+| 根路径 `/` | ✅ |
+| 模型大小写 | ✅ 不敏感 |
 
 ## 模型路由
 

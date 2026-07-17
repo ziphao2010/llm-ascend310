@@ -184,12 +184,17 @@ class CompReq(BaseModel):
     temperature: float=0.1; max_tokens: int=256; stream: bool=False; seed: Optional[int]=None
 
 async def verify(req: Request):
-    if req.headers.get("Authorization","") != f"Bearer {API_KEY}":
-        from fastapi import HTTPException; raise HTTPException(401,"Invalid API key")
+    if not API_KEY:
+        return  # no auth configured
+    auth = req.headers.get("Authorization", "")
+    if auth != f"Bearer {API_KEY}":
+        from fastapi import HTTPException
+        raise HTTPException(401, "Invalid API key")
 
 @app.get("/health")
+@app.get("/")
 async def health():
-    return {"status":"ok","model":"MiniCPM5-1B","hardware":"Ascend310","version":"1.0.0"}
+    return {"status":"ok","model":"MiniCPM5-1B","hardware":"Ascend310","version":"1.0.0","endpoints":["/v1/models","/v1/chat/completions","/v1/completions","/health"]}
 
 @app.post("/v1/chat/completions")
 async def chat(body: ChatReq, req: Request):
@@ -202,7 +207,11 @@ async def completions(body: CompReq, req: Request):
 @app.get("/v1/models")
 async def models(req: Request):
     await verify(req)
-    return {"object":"list","data":[{"id":"minicpm1","object":"model","created":int(time.time()),"owned_by":"empero-ai"}]}
+    instances = ["minicpm1","minicpm2","minicpm3","minicpm4"]
+    return {"object":"list","data":[
+        {"id":m,"object":"model","created":int(time.time()),"owned_by":"empero-ai"}
+        for m in instances
+    ]}
 
 def _handle(body, is_chat):
     np.random.seed(body.seed or int(time.time()*1000)&0xFFFFFFFF)
