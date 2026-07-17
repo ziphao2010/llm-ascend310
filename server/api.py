@@ -1,322 +1,228 @@
-"""
-OpenAI-compatible API server for llm-ascend310.
-Manages up to 4 independent model instances across 4 NPU chips.
-"""
-import os, sys, time, json, threading, logging, asyncio, numpy as np
+#!/usr/bin/env python3
+"""Minimal working MiniCPM5-1B API server with all fixes applied."""
+import os, sys, time, json, numpy as np, asyncio, threading, logging, uvicorn
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, "/root/llm-ascend310")
 from engine.base import Device
-from engine.model_loader import ModelConfig, WeightLoader
-from engine.llama_engine import LLaMAEngine
-
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
-log = logging.getLogger("llm-server")
-
-API_KEY = os.environ.get("LLM_API_KEY", "llm101007")
-DEFAULT_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "/root/models/MiniCPM5-1B")
-MAX_CONTEXT = int(os.environ.get("LLM_MAX_CONTEXT", "131072"))
-INSTANCES = int(os.environ.get("LLM_INSTANCES", "4"))
-EOS_TOKENS = {1, 130073}  # MiniCPM5 EOS
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MODEL INSTANCE (1 per chip)
-# ═══════════════════════════════════════════════════════════════════
-class ModelInstance:
-    """One model instance running on one NPU chip."""
-
-    def __init__(self, instance_id: int, device_id: int, model_path: str):
-        self.id = instance_id
-        self.device_id = device_id
-        self.model_path = model_path
-        self.name = f"MiniCPM{instance_id + 1}"
-        self.lock = threading.Lock()  # serializes requests to this instance
-
-        log.info(f"Instance {self.name}: loading on device {device_id}...")
-        t0 = time.time()
-
-        self.cfg = ModelConfig(model_path)
-        self.dev = Device(device_id)
-        self.engine = LLaMAEngine(self.cfg, device_ids=[device_id])
-
-        # Load weights
-        wl = WeightLoader(model_path)
-        wl.load()
-        self.engine.load_weights(wl, device_idx=0)
-
-        # Load tokenizer
-        import transformers
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True)
-
-        # Pre-convert LM head for speed (CPU matmul)
-        self.lm_head_f32_t = np.ascontiguousarray(
-            self.engine.lm_head.T.astype(np.float32))
-        self.norm_weight = self.engine.norm_weight
-
-        log.info(f"Instance {self.name}: ready ({time.time()-t0:.0f}s)")
-
-    def final_norm(self, h: np.ndarray) -> np.ndarray:
-        """Final RMSNorm before LM head."""
-        h32 = h.astype(np.float32)
-        rms = np.sqrt(np.mean(h32 ** 2) + 1e-6)
-        return ((h32 / rms) * self.norm_weight).astype(np.float16)
-
-    def logits(self, h: np.ndarray) -> np.ndarray:
-        """LM head: hidden → vocab logits."""
-        return h.astype(np.float32) @ self.lm_head_f32_t
-
-    def sample(self, logits: np.ndarray, temperature=0.6, top_p=0.9, top_k=50) -> int:
-        """Sample next token with temperature/top-p/top-k."""
-        if temperature > 0:
-            logits = logits / temperature
-        if top_k > 0 and top_k < logits.shape[0]:
-            kth = np.partition(logits, -top_k)[-top_k]
-            logits[logits < kth] = -np.inf
-        if top_p < 1.0 and top_p > 0:
-            si = np.argsort(logits)[::-1]
-            sl = logits[si]
-            mx = np.max(sl[np.isfinite(sl)])
-            if np.isfinite(mx):
-                cs = np.cumsum(np.exp(sl - mx))
-                sl[cs / cs[-1] > top_p] = -np.inf
-                logits[si] = sl
-        finite = logits[np.isfinite(logits)]
-        if len(finite) == 0:
-            return int(np.random.randint(0, logits.shape[0]))
-        mx = np.max(finite)
-        probs = np.exp((logits - mx).clip(-100, 100))
-        probs = probs / np.sum(probs)
-        if not np.all(np.isfinite(probs)) or np.sum(probs) <= 0:
-            return int(np.random.randint(0, logits.shape[0]))
-        return int(np.random.choice(logits.shape[0], p=probs))
-
-    def generate(self, input_ids, max_new=256, temperature=0.6,
-                 top_p=0.9, top_k=50, callback=None):
-        """Generate tokens with KV cache management."""
-        with self.lock:
-            kv = [[] for _ in range(self.cfg.num_layers)]
-            generated = []
-            t0 = time.time()
-
-            # Prefill
-            for pos, tid in enumerate(input_ids):
-                h = self.engine.embed[tid].astype(np.float16)
-                self.engine.forward(h, kv, pos, device_idx=0)
-
-            # Decode
-            last_id = input_ids[-1]
-            for step in range(max_new):
-                h = self.engine.embed[last_id].astype(np.float16)
-                h = self.engine.forward(h, kv, len(input_ids) + step,
-                                        device_idx=0)
-
-                h = self.final_norm(h)
-                ll = self.logits(h)
-                tid = self.sample(ll, temperature, top_p, top_k)
-
-                generated.append(tid)
-                if callback:
-                    callback(self.tokenizer.decode([tid]), tid)
-
-                last_id = tid
-                if tid in EOS_TOKENS:
-                    break
-
-            return {
-                "text": self.tokenizer.decode(generated, skip_special_tokens=True),
-                "tokens": generated,
-                "prompt_tokens": len(input_ids),
-                "completion_tokens": len(generated),
-                "total_tokens": len(input_ids) + len(generated),
-                "time_s": time.time() - t0,
-            }
-
-    def format_chat(self, messages):
-        """Apply chat template."""
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False)
-        except Exception as e:
-            log.warning(f"Chat template fallback: {e}")
-            out = ""
-            for m in messages:
-                out += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
-            return out + "<|im_start|>assistant\n"
-
-
-# ═══════════════════════════════════════════════════════════════════
-# INSTANCE POOL (load balancing across instances)
-# ═══════════════════════════════════════════════════════════════════
-class InstancePool:
-    """Manages multiple model instances across chips."""
-
-    def __init__(self, model_path: str, num_instances: int = 4):
-        self.instances = []
-        for i in range(num_instances):
-            inst = ModelInstance(i, i, model_path)
-            self.instances.append(inst)
-        self._rr = 0  # round-robin counter
-        log.info(f"Instance pool ready: {num_instances} instances on {num_instances} chips")
-
-    def get_next(self) -> ModelInstance:
-        """Round-robin load balancing."""
-        inst = self.instances[self._rr % len(self.instances)]
-        self._rr += 1
-        return inst
-
-    def get_by_name(self, name: str) -> ModelInstance:
-        for inst in self.instances:
-            if inst.name == name:
-                return inst
-        return None
-
-    def list_models(self):
-        return [{"id": inst.name, "object": "model",
-                 "created": int(time.time()), "owned_by": "llm-ascend310"}
-                for inst in self.instances]
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FASTAPI
-# ═══════════════════════════════════════════════════════════════════
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from engine.model_loader import WeightLoader
+from tokenizers import Tokenizer
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Union, Dict, Any
 
-app = FastAPI(title="llm-ascend310 API", version="1.0.0")
-pool: InstancePool = None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+log = logging.getLogger("minicpm")
 
+MP = "/root/models/MiniCPM5-1B"
+API_KEY = os.environ.get("LLM_API_KEY", "wsh101007")
+MAX_CTX = int(os.environ.get("LLM_MAX_CONTEXT", "32768"))
+H, QD, KD, IM, NH, NKV, HD, VS = 1536, 2048, 256, 4608, 16, 2, 128, 130560
+
+# ── Global engine (loaded once) ──
+class Model:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    i = super().__new__(cls)
+                    i._init()
+                    cls._instance = i
+        return cls._instance
+
+    def _init(self):
+        log.info("Loading MiniCPM5-1B engine...")
+        t0 = time.time()
+        wl = WeightLoader(MP); wl.load()
+        cw = wl.weights
+        self.embed = cw["model.embed_tokens.weight"].astype(np.float16)
+        self.norm_w = cw["model.norm.weight"].astype(np.float16)
+        self.lm_t = np.ascontiguousarray(cw["lm_head.weight"].T.astype(np.float32))
+        self.tk = Tokenizer.from_file(f"{MP}/tokenizer.json")
+        self.dev = Device(0)
+        self.dev.set_device()
+
+        log.info("Uploading weights...")
+        self.w = {}
+        for i in range(24):
+            for k, v in wl.get_layer_weights(i).items():
+                vf = v.astype(np.float16)
+                d = np.ascontiguousarray(vf.T) if any(x in k for x in ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]) else vf
+                p = self.dev.malloc(d.nbytes); self.dev.h2d(p, d)
+                self.w[f"{i}.{k}"] = p
+            if i % 6 == 5: log.info(f"  Layers 0-{i}")
+        log.info(f"Ready: {time.time()-t0:.0f}s, {len(self.w)} tensors")
+
+    def g(self, i, k): return self.w.get(f"{i}.{k}")
+
+    def rms(self, h, wgt):
+        h32 = h.astype(np.float32)
+        return ((h32 / np.sqrt(np.mean(h32**2) + 1e-6)) * wgt).astype(np.float16)
+
+    def rope(self, x, p):
+        hd = HD // 2; inv = 1.0 / (5000000.0 ** (np.arange(0, HD, 2, dtype=np.float32) / HD))
+        c, s = np.cos(p * inv).astype(np.float16), np.sin(p * inv).astype(np.float16)
+        x1, x2 = x[:, :hd], x[:, hd:]
+        return np.concatenate([x1*c - x2*s, x1*s + x2*c], axis=-1)
+
+    def forward(self, h_cpu, kv, tpos):
+        """One token forward through 24 layers. All fixes applied."""
+        hp = self.dev.malloc(H*2); self.dev.h2d(hp, h_cpu)
+        for i in range(24):
+            ln = np.empty(H, dtype=np.float16); self.dev.d2h(ln, self.w[f"{i}.input_layernorm.weight"])
+            hc = np.empty(H, dtype=np.float16); self.dev.d2h(hc, hp)
+            hn = self.rms(hc, ln)
+            hnp = self.dev.malloc(H*2); self.dev.h2d(hnp, hn)
+            q = self.dev.exec("mm_1_1536_2048", [(hnp, H*2), (self.g(i,"self_attn.q_proj.weight"), QD*H*2)])[0]
+            k = self.dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.k_proj.weight"), KD*H*2)])
+            v = self.dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.v_proj.weight"), KD*H*2)])
+            self.dev.free(hnp)
+            qc = np.empty(QD, dtype=np.float16); self.dev.d2h(qc, q); self.dev.free(q)
+            kc = np.empty(KD, dtype=np.float16); self.dev.d2h(kc, k[0]); self.dev.free(k[0])
+            vc = np.empty(KD, dtype=np.float16); self.dev.d2h(vc, v[0]); self.dev.free(v[0])
+            qv = qc.reshape(NH, HD).astype(np.float32); kr = kc.reshape(NKV, HD).astype(np.float32)
+            qr = self.rope(qv, tpos); krot = self.rope(kr, tpos)
+            kv[i].append((krot.copy(), vc.reshape(NKV, HD).astype(np.float32).copy()))
+            T = len(kv[i])
+            ka = np.array([kv[i][t][0] for t in range(T)]).reshape(T, NKV, HD)
+            va = np.array([kv[i][t][1] for t in range(T)]).reshape(T, NKV, HD)
+            ka = ka.repeat(NH//NKV, 1).reshape(-1, HD); va = va.repeat(NH//NKV, 1).reshape(-1, HD)
+            sc = (qr @ ka.T) * (HD**-0.5); sc -= np.max(sc, -1, keepdims=True)
+            an = np.exp(sc) / np.sum(np.exp(sc), -1, keepdims=True)
+            ao = (an @ va).astype(np.float16).ravel()
+            ap = self.dev.malloc(H*2); self.dev.h2d(ap, ao)  # ← O PROJ FIX
+            op = self.dev.exec("mm_1_1536_1536", [(ap, H*2), (self.g(i,"self_attn.o_proj.weight"), H*QD*2)])[0]
+            self.dev.free(ap)
+            ar = self.dev.exec("ops_add", [(hp, H*2), (op, H*2)])[0]
+            self.dev.d2d(hp, ar, H*2); self.dev.free(ar); self.dev.free(op)
+            pw = np.empty(H, dtype=np.float16); self.dev.d2h(pw, self.g(i,"post_attention_layernorm.weight"))
+            h2 = np.empty(H, dtype=np.float16); self.dev.d2h(h2, hp)
+            h2n = self.rms(h2, pw)
+            h2p = self.dev.malloc(H*2); self.dev.h2d(h2p, h2n)
+            gp = self.dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.gate_proj.weight"), IM*H*2)])
+            up = self.dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.up_proj.weight"), IM*H*2)])
+            self.dev.free(h2p)
+            gg = np.empty(IM, dtype=np.float16); self.dev.d2h(gg, gp[0]); self.dev.free(gp[0])
+            uu = np.empty(IM, dtype=np.float16); self.dev.d2h(uu, up[0]); self.dev.free(up[0])
+            g32 = gg.astype(np.float32)
+            gu = (g32 * (1.0/(1.0+np.exp(-g32))) * uu.astype(np.float32)).astype(np.float16)
+            hi = IM//2
+            gup = self.dev.malloc(IM*2); self.dev.h2d(gup, gu)
+            dp = self.g(i, "mlp.down_proj.weight")
+            dd = self.dev.exec("mm_1_2304_1536", [(gup, hi*2), (dp, hi*H*2)])
+            d2 = self.dev.exec("mm_1_2304_1536", [(gup+hi*2, hi*2), (dp+hi*H*2, hi*H*2)])
+            self.dev.free(gup)
+            ds = self.dev.exec("ops_add", [(dd[0], H*2), (d2[0], H*2)])[0]
+            self.dev.free(dd[0]); self.dev.free(d2[0])
+            r2 = self.dev.exec("ops_add", [(hp, H*2), (ds, H*2)])[0]
+            self.dev.d2d(hp, r2, H*2); self.dev.free(ds); self.dev.free(r2)
+        ho = np.empty(H, dtype=np.float16); self.dev.d2h(ho, hp); self.dev.free(hp)
+        return ho
+
+    def generate(self, input_ids, max_new=256, temp=0.1, callback=None):
+        kv = [[] for _ in range(24)]
+        gen, t0 = [], time.time()
+
+        for p, tid in enumerate(input_ids):
+            self.forward(self.embed[tid].astype(np.float16), kv, p)
+
+        last = input_ids[-1]
+        for step in range(max_new):
+            ho = self.forward(self.embed[last].astype(np.float16), kv, len(input_ids)+step)
+            h32 = ho.astype(np.float32); rms = np.sqrt(np.mean(h32**2)+1e-6)
+            hn = ((h32/rms)*self.norm_w).astype(np.float16)
+            ll = hn.astype(np.float32) @ self.lm_t
+
+            ll_s = (ll/temp).clip(-100,100)
+            kth = np.partition(ll_s, -40)[-40]; ll_s[ll_s<kth] = -np.inf
+            ll_s -= np.max(ll_s[np.isfinite(ll_s)])
+            p = np.exp(ll_s)/np.sum(np.exp(ll_s))
+            if not np.all(np.isfinite(p)): last = int(np.random.randint(0, VS))
+            else: last = int(np.random.choice(VS, p=p))
+
+            gen.append(last)
+            if callback: callback(self.tk.decode([last]), last)
+            if last in {1, 130073}: break
+
+        return {"text": self.tk.decode(gen, skip_special_tokens=True),
+                "tokens": gen, "count": len(gen),
+                "time_s": time.time()-t0,
+                "tok_s": len(gen)/(time.time()-t0+0.001)}
+
+# ── FastAPI ──
+app = FastAPI(title="MiniCPM5-1B@Ascend310", version="1.0.0")
 
 class Message(BaseModel):
     role: str; content: Union[str, List[Dict[str, Any]]]
 class ChatReq(BaseModel):
-    model: str = "MiniCPM1"
-    messages: List[Message]
-    temperature: float = 0.6; top_p: float = 0.9; top_k: int = 50
-    max_tokens: int = 256; stream: bool = False; seed: Optional[int] = None
+    model: str="minicpm1"; messages: List[Message]
+    temperature: float=0.1; max_tokens: int=256; stream: bool=False; seed: Optional[int]=None
 class CompReq(BaseModel):
-    model: str = "MiniCPM1"
-    prompt: str
-    temperature: float = 0.6; top_p: float = 0.9; top_k: int = 50
-    max_tokens: int = 256; stream: bool = False; seed: Optional[int] = None
-
+    model: str="minicpm1"; prompt: str
+    temperature: float=0.1; max_tokens: int=256; stream: bool=False; seed: Optional[int]=None
 
 async def verify(req: Request):
-    auth = req.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        raise HTTPException(401, "Invalid API key")
-
+    if req.headers.get("Authorization","") != f"Bearer {API_KEY}":
+        from fastapi import HTTPException; raise HTTPException(401,"Invalid API key")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "instances": len(pool.instances) if pool else 0,
-            "max_context": MAX_CONTEXT, "version": "1.0.0"}
-
-@app.get("/v1/models")
-async def list_models(req: Request):
-    await verify(req)
-    return {"object": "list", "data": pool.list_models()}
+    return {"status":"ok","model":"MiniCPM5-1B","hardware":"Ascend310","version":"1.0.0"}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatReq, req: Request):
-    await verify(req)
-    return _handle(body, is_chat=True)
+async def chat(body: ChatReq, req: Request):
+    await verify(req); return _handle(body,True)
 
 @app.post("/v1/completions")
 async def completions(body: CompReq, req: Request):
-    await verify(req)
-    return _handle(body, is_chat=False)
+    await verify(req); return _handle(body,False)
 
+@app.get("/v1/models")
+async def models(req: Request):
+    await verify(req)
+    return {"object":"list","data":[{"id":"minicpm1","object":"model","created":int(time.time()),"owned_by":"empero-ai"}]}
 
 def _handle(body, is_chat):
-    np.random.seed(body.seed if body.seed else int(time.time() * 1000) & 0xFFFFFFFF)
-
-    # Route to instance
-    inst = pool.get_by_name(body.model) or pool.get_next()
-    log.info(f"Route to {inst.name} (device {inst.device_id})")
-
+    np.random.seed(body.seed or int(time.time()*1000)&0xFFFFFFFF)
+    m = Model()
     if is_chat:
-        msgs = [m.model_dump() for m in body.messages]
-        prompt = inst.format_chat(msgs)
+        msgs = [x.model_dump() for x in body.messages]
+        prompt = "".join(f"<|im_start|>{x['role']}\n{x['content']}<|im_end|>\n" for x in msgs) + "<|im_start|>assistant\n"
     else:
         prompt = body.prompt
-
-    input_ids = inst.tokenizer.encode(prompt, truncation=True, max_length=MAX_CONTEXT)
-    log.info(f"  Input: {len(input_ids)} tokens, max_new={body.max_tokens}")
+    ids = m.tk.encode(prompt).ids[:MAX_CTX]
+    log.info(f"Input: {len(ids)} tokens")
 
     if body.stream:
-        return _stream(inst, input_ids, body, is_chat)
-
-    result = inst.generate(input_ids, body.max_tokens,
-                           body.temperature, body.top_p, body.top_k)
-    log.info(f"  Done: {result['completion_tokens']} tok in {result['time_s']:.1f}s")
-
-    if is_chat:
-        choice = {"index": 0,
-                  "message": {"role": "assistant", "content": result["text"]},
-                  "finish_reason": "stop"}
-    else:
-        choice = {"index": 0, "text": result["text"], "finish_reason": "stop"}
-
-    return JSONResponse(content={
-        "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion" if is_chat else "text_completion",
-        "created": int(time.time()), "model": body.model, "choices": [choice],
-        "usage": {"prompt_tokens": result["prompt_tokens"],
-                  "completion_tokens": result["completion_tokens"],
-                  "total_tokens": result["total_tokens"]}})
-
-
-def _stream(inst, input_ids, body, is_chat):
-    tq = asyncio.Queue()
-    def run():
-        try:
-            inst.generate(input_ids, body.max_tokens, body.temperature,
-                          body.top_p, body.top_k,
-                          callback=lambda text, tid: tq.put_nowait(("token", text, tid)))
-            tq.put_nowait(("done", None, None))
-        except Exception as ex:
-            log.error(f"Stream error: {ex}")
-            tq.put_nowait(("error", str(ex), None))
-    threading.Thread(target=run, daemon=True).start()
-
-    async def stream():
-        if is_chat:
+        q = asyncio.Queue()
+        def run():
+            try: m.generate(ids, body.max_tokens, body.temperature, callback=lambda t,ti: q.put_nowait(("tok",t,ti)))
+            except Exception as e: log.error(f"Error: {e}"); q.put_nowait(("err",str(e),0))
+            q.put_nowait(("done",None,None))
+        threading.Thread(target=run,daemon=True).start()
+        async def stream():
             yield f"data: {json.dumps({'choices':[{'delta':{'role':'assistant'},'index':0}]})}\n\n"
-        while True:
-            msg = await tq.get()
-            if msg[0] == "token":
-                yield f"data: {json.dumps({'choices':[{'delta':{'content':msg[1]},'index':0}]})}\n\n"
-            elif msg[0] == "done":
-                yield "data: [DONE]\n\n"; break
-            elif msg[0] == "error":
-                yield f"data: {json.dumps({'error':msg[1]})}\n\n"; break
+            while True:
+                msg = await q.get()
+                if msg[0]=="tok": yield f"data: {json.dumps({'choices':[{'delta':{'content':msg[1]},'index':0}]})}\n\n"
+                elif msg[0]=="done": yield "data: [DONE]\n\n"; break
+                else: yield f"data: {json.dumps({'error':msg[1]})}\n\n"; break
+        return StreamingResponse(stream(),media_type="text/event-stream",
+            headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
 
-    return StreamingResponse(stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                 "X-Accel-Buffering": "no"})
+    result = m.generate(ids, body.max_tokens, body.temperature)
+    text = result["text"]
+    choice = {"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"} if is_chat else {"index":0,"text":text,"finish_reason":"stop"}
+    return JSONResponse(content={
+        "id":f"chatcmpl-{int(time.time())}","object":"chat.completion" if is_chat else "text_completion",
+        "created":int(time.time()),"model":body.model,"choices":[choice],
+        "usage":{"prompt_tokens":len(ids),"completion_tokens":result["count"],"total_tokens":len(ids)+result["count"]}})
 
-
-# ═══════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    log.info("=" * 50)
-    log.info("llm-ascend310 — Multi-Instance LLM Server")
-    log.info("=" * 50)
-
-    model_path = os.environ.get("LLM_MODEL_PATH", DEFAULT_MODEL_PATH)
-    num_instances = INSTANCES
-
-    log.info(f"Model: {model_path}")
-    log.info(f"Instances: {num_instances}")
-    log.info(f"Max context: {MAX_CONTEXT}")
-
-    pool = InstancePool(model_path, num_instances)
-
+if __name__=="__main__":
+    log.info("Starting MiniCPM5-1B on Ascend 310")
+    m = Model()
     port = int(os.environ.get("PORT", 8000))
-    log.info(f"Listening on 0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
