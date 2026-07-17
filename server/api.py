@@ -7,6 +7,7 @@ from engine.base import Device
 from engine.model_loader import WeightLoader
 from tokenizers import Tokenizer
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Union, Dict, Any
@@ -154,6 +155,15 @@ class Model:
 
 # ── FastAPI ──
 app = FastAPI(title="MiniCPM5-1B@Ascend310", version="1.0.0")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Message(BaseModel):
     role: str; content: Union[str, List[Dict[str, Any]]]
