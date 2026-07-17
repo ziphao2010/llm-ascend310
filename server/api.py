@@ -165,6 +165,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Explicit OPTIONS routes for browser CORS preflight
+@app.options("/{path:path}")
+async def preflight_all(path: str):
+    return JSONResponse(content={}, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    })
+
 class Message(BaseModel):
     role: str; content: Union[str, List[Dict[str, Any]]]
 class ChatReq(BaseModel):
