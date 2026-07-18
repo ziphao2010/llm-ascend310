@@ -61,6 +61,7 @@ class Model:
         self.buf_hn = self.dev.malloc(H*2)   # rmsnorm output
         self.buf_hn2 = self.dev.malloc(H*2)  # post-attn rmsnorm
         self.buf_gup = self.dev.malloc(IM*2) # MLP intermediate
+        self.exec_lock = threading.Lock()    # serialize NPU access
         log.info(f"Buffers allocated")
         log.info(f"Ready: {time.time()-t0:.0f}s, {len(self.w)} tensors")
 
@@ -131,26 +132,27 @@ class Model:
         kv = [[] for _ in range(24)]
         gen, t0 = [], time.time()
 
-        for p, tid in enumerate(input_ids):
-            self.forward(self.embed[tid].astype(np.float16), kv, p)
+        with self.exec_lock:
+            for p, tid in enumerate(input_ids):
+                self.forward(self.embed[tid].astype(np.float16), kv, p)
 
-        last = input_ids[-1]
-        for step in range(max_new):
-            ho = self.forward(self.embed[last].astype(np.float16), kv, len(input_ids)+step)
-            h32 = ho.astype(np.float32); rms = np.sqrt(np.mean(h32**2)+1e-6)
-            hn = ((h32/rms)*self.norm_w).astype(np.float16)
-            ll = hn.astype(np.float32) @ self.lm_t
+            last = input_ids[-1]
+            for step in range(max_new):
+                ho = self.forward(self.embed[last].astype(np.float16), kv, len(input_ids)+step)
+                h32 = ho.astype(np.float32); rms = np.sqrt(np.mean(h32**2)+1e-6)
+                hn = ((h32/rms)*self.norm_w).astype(np.float16)
+                ll = hn.astype(np.float32) @ self.lm_t
 
-            ll_s = (ll/temp).clip(-100,100)
-            kth = np.partition(ll_s, -40)[-40]; ll_s[ll_s<kth] = -np.inf
-            ll_s -= np.max(ll_s[np.isfinite(ll_s)])
-            p = np.exp(ll_s)/np.sum(np.exp(ll_s))
-            if not np.all(np.isfinite(p)): last = int(np.random.randint(0, VS))
-            else: last = int(np.random.choice(VS, p=p))
+                ll_s = (ll/temp).clip(-100,100)
+                kth = np.partition(ll_s, -40)[-40]; ll_s[ll_s<kth] = -np.inf
+                ll_s -= np.max(ll_s[np.isfinite(ll_s)])
+                p = np.exp(ll_s)/np.sum(np.exp(ll_s))
+                if not np.all(np.isfinite(p)): last = int(np.random.randint(0, VS))
+                else: last = int(np.random.choice(VS, p=p))
 
-            gen.append(last)
-            if callback: callback(self.tk.decode([last]), last)
-            if last in {1, 130073}: break
+                gen.append(last)
+                if callback: callback(self.tk.decode([last]), last)
+                if last in {1, 130073}: break
 
         return {"text": self.tk.decode(gen, skip_special_tokens=True),
                 "tokens": gen, "count": len(gen),
