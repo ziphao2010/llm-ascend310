@@ -100,27 +100,23 @@ class Device:
 
     def exec(self, model_name: str, inputs: List[Tuple[int, int]]) -> List[int]:
         """
-        Execute a compiled .om model on NPU.
+        Execute a compiled .om model on NPU. Caches output buffers for reuse.
 
         Args:
-            model_name: name without .om (e.g. 'mm_1_1536_4608')
+            model_name: name without .om
             inputs: list of (device_ptr, size_bytes) tuples
 
         Returns:
             list of output device pointers
         """
-        om_dir = None  # Will be set per-model or globally
-
         if model_name not in self._oc:
-            # Search for .om file
+            import os
             path = None
             for d in ["/root/llm-ascend310/om_models",
                        "/root/qwythos_engine/om_models"]:
-                import os
                 p = f"{d}/{model_name}.om"
                 if os.path.exists(p):
-                    path = p
-                    break
+                    path = p; break
             if path is None:
                 raise FileNotFoundError(f"om model not found: {model_name}.om")
 
@@ -130,10 +126,27 @@ class Device:
                 raise RuntimeError(f"aclmdlLoadFromFile({path}) failed: {ret}")
             desc = self.L.aclmdlCreateDesc()
             self.L.aclmdlGetDesc(desc, mid.value)
-            self._oc[model_name] = {"id": mid.value, "desc": desc}
+
+            num_out = self.L.aclmdlGetNumOutputs(desc)
+            out_bufs = []
+            out_sizes = []
+            for i in range(num_out):
+                sz = self.L.aclmdlGetOutputSizeByIndex(desc, i)
+                p = c_void_p(0)
+                r = self.L.aclrtMalloc(byref(p), sz, 1)
+                if r != 0:
+                    raise RuntimeError(f"{model_name}: aclrtMalloc({sz}) failed: {r}")
+                out_bufs.append(p.value)
+                out_sizes.append(sz)
+
+            self._oc[model_name] = {"id": mid.value, "desc": desc,
+                                    "out_bufs": out_bufs, "out_sizes": out_sizes}
 
         om = self._oc[model_name]
         desc = om["desc"]
+        out_bufs = om["out_bufs"]
+        out_sizes = om["out_sizes"]
+
         in_ds = self.L.aclmdlCreateDataset()
         out_ds = self.L.aclmdlCreateDataset()
 
@@ -141,17 +154,21 @@ class Device:
             buf = self.L.aclCreateDataBuffer(c_void_p(ptr), sz)
             self.L.aclmdlAddDatasetBuffer(in_ds, buf)
 
-        num_out = self.L.aclmdlGetNumOutputs(desc)
-        out_ptrs = []
-        for i in range(num_out):
-            sz = self.L.aclmdlGetOutputSizeByIndex(desc, i)
-            p = c_void_p(0)
-            self.L.aclrtMalloc(byref(p), sz, 1)
-            out_ptrs.append(p.value)
-            buf = self.L.aclCreateDataBuffer(c_void_p(p.value), sz)
+        for i, ptr in enumerate(out_bufs):
+            buf = self.L.aclCreateDataBuffer(c_void_p(ptr), out_sizes[i])
             self.L.aclmdlAddDatasetBuffer(out_ds, buf)
 
         ret = self.L.aclmdlExecute(om["id"], in_ds, out_ds)
+        self.L.aclmdlDestroyDataset(in_ds)
+        self.L.aclmdlDestroyDataset(out_ds)
+
+        if ret != 0:
+            raise RuntimeError(f"{model_name} exec failed: {ret}")
+
+        return out_bufs  # caller should NOT free these (they're cached)
+
+
+
         self.L.aclmdlDestroyDataset(in_ds)
         self.L.aclmdlDestroyDataset(out_ds)
 

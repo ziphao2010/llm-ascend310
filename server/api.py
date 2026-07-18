@@ -89,9 +89,9 @@ class Model:
             q = dev.exec("mm_1_1536_2048", [(hnp, H*2), (self.g(i,"self_attn.q_proj.weight"), QD*H*2)])[0]
             k = dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.k_proj.weight"), KD*H*2)])
             v = dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.v_proj.weight"), KD*H*2)])
-            qc = np.empty(QD, dtype=np.float16); dev.d2h(qc, q); dev.free(q)
-            kc = np.empty(KD, dtype=np.float16); dev.d2h(kc, k[0]); dev.free(k[0])
-            vc = np.empty(KD, dtype=np.float16); dev.d2h(vc, v[0]); dev.free(v[0])
+            qc = np.empty(QD, dtype=np.float16); dev.d2h(qc, q)
+            kc = np.empty(KD, dtype=np.float16); dev.d2h(kc, k[0])
+            vc = np.empty(KD, dtype=np.float16); dev.d2h(vc, v[0])
             qv = qc.reshape(NH, HD).astype(np.float32); kr = kc.reshape(NKV, HD).astype(np.float32)
             qr = self.rope(qv, tpos); krot = self.rope(kr, tpos)
             kv[i].append((krot.copy(), vc.reshape(NKV, HD).astype(np.float32).copy()))
@@ -105,15 +105,15 @@ class Model:
             dev.h2d(hnp, ao)
             op = dev.exec("mm_1_1536_1536", [(hnp, H*2), (self.g(i,"self_attn.o_proj.weight"), H*QD*2)])[0]
             ar = dev.exec("ops_add", [(hp, H*2), (op, H*2)])[0]
-            dev.d2d(hp, ar, H*2); dev.free(ar); dev.free(op)
+            dev.d2d(hp, ar, H*2)
             pw = np.empty(H, dtype=np.float16); dev.d2h(pw, self.g(i,"post_attention_layernorm.weight"))
             h2 = np.empty(H, dtype=np.float16); dev.d2h(h2, hp)
             h2n = self.rms(h2, pw)
             h2p = self.buf_hn2; dev.h2d(h2p, h2n)
             gp = dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.gate_proj.weight"), IM*H*2)])
             up = dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.up_proj.weight"), IM*H*2)])
-            gg = np.empty(IM, dtype=np.float16); dev.d2h(gg, gp[0]); dev.free(gp[0])
-            uu = np.empty(IM, dtype=np.float16); dev.d2h(uu, up[0]); dev.free(up[0])
+            gg = np.empty(IM, dtype=np.float16); dev.d2h(gg, gp[0])
+            uu = np.empty(IM, dtype=np.float16); dev.d2h(uu, up[0])
             g32 = gg.astype(np.float32)
             gu = (g32 * (1.0/(1.0+np.exp(-g32))) * uu.astype(np.float32)).astype(np.float16)
             hi = IM//2
@@ -122,9 +122,8 @@ class Model:
             dd = dev.exec("mm_1_2304_1536", [(gup, hi*2), (dp, hi*H*2)])
             d2 = dev.exec("mm_1_2304_1536", [(gup+hi*2, hi*2), (dp+hi*H*2, hi*H*2)])
             ds = dev.exec("ops_add", [(dd[0], H*2), (d2[0], H*2)])[0]
-            dev.free(dd[0]); dev.free(d2[0])
             r2 = dev.exec("ops_add", [(hp, H*2), (ds, H*2)])[0]
-            dev.d2d(hp, r2, H*2); dev.free(ds); dev.free(r2)
+            dev.d2d(hp, r2, H*2)
         ho = np.empty(H, dtype=np.float16); dev.d2h(ho, hp)
         return ho
 
