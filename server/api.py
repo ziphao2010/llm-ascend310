@@ -55,6 +55,13 @@ class Model:
                 p = self.dev.malloc(d.nbytes); self.dev.h2d(p, d)
                 self.w[f"{i}.{k}"] = p
             if i % 6 == 5: log.info(f"  Layers 0-{i}")
+
+        # Pre-allocate working buffers to avoid OOM/fragmentation
+        self.buf_hp = self.dev.malloc(H*2)   # main hidden state
+        self.buf_hn = self.dev.malloc(H*2)   # rmsnorm output
+        self.buf_hn2 = self.dev.malloc(H*2)  # post-attn rmsnorm
+        self.buf_gup = self.dev.malloc(IM*2) # MLP intermediate
+        log.info(f"Buffers allocated")
         log.info(f"Ready: {time.time()-t0:.0f}s, {len(self.w)} tensors")
 
     def g(self, i, k): return self.w.get(f"{i}.{k}")
@@ -70,20 +77,21 @@ class Model:
         return np.concatenate([x1*c - x2*s, x1*s + x2*c], axis=-1)
 
     def forward(self, h_cpu, kv, tpos):
-        """One token forward through 24 layers. All fixes applied."""
-        hp = self.dev.malloc(H*2); self.dev.h2d(hp, h_cpu)
+        """One token forward through 24 layers. Pre-allocated buffers, no malloc/free."""
+        dev = self.dev
+        hp = self.buf_hp
+        dev.h2d(hp, h_cpu)
         for i in range(24):
-            ln = np.empty(H, dtype=np.float16); self.dev.d2h(ln, self.w[f"{i}.input_layernorm.weight"])
-            hc = np.empty(H, dtype=np.float16); self.dev.d2h(hc, hp)
+            ln = np.empty(H, dtype=np.float16); dev.d2h(ln, self.w[f"{i}.input_layernorm.weight"])
+            hc = np.empty(H, dtype=np.float16); dev.d2h(hc, hp)
             hn = self.rms(hc, ln)
-            hnp = self.dev.malloc(H*2); self.dev.h2d(hnp, hn)
-            q = self.dev.exec("mm_1_1536_2048", [(hnp, H*2), (self.g(i,"self_attn.q_proj.weight"), QD*H*2)])[0]
-            k = self.dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.k_proj.weight"), KD*H*2)])
-            v = self.dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.v_proj.weight"), KD*H*2)])
-            self.dev.free(hnp)
-            qc = np.empty(QD, dtype=np.float16); self.dev.d2h(qc, q); self.dev.free(q)
-            kc = np.empty(KD, dtype=np.float16); self.dev.d2h(kc, k[0]); self.dev.free(k[0])
-            vc = np.empty(KD, dtype=np.float16); self.dev.d2h(vc, v[0]); self.dev.free(v[0])
+            hnp = self.buf_hn; dev.h2d(hnp, hn)
+            q = dev.exec("mm_1_1536_2048", [(hnp, H*2), (self.g(i,"self_attn.q_proj.weight"), QD*H*2)])[0]
+            k = dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.k_proj.weight"), KD*H*2)])
+            v = dev.exec("mm_1_1536_256", [(hnp, H*2), (self.g(i,"self_attn.v_proj.weight"), KD*H*2)])
+            qc = np.empty(QD, dtype=np.float16); dev.d2h(qc, q); dev.free(q)
+            kc = np.empty(KD, dtype=np.float16); dev.d2h(kc, k[0]); dev.free(k[0])
+            vc = np.empty(KD, dtype=np.float16); dev.d2h(vc, v[0]); dev.free(v[0])
             qv = qc.reshape(NH, HD).astype(np.float32); kr = kc.reshape(NKV, HD).astype(np.float32)
             qr = self.rope(qv, tpos); krot = self.rope(kr, tpos)
             kv[i].append((krot.copy(), vc.reshape(NKV, HD).astype(np.float32).copy()))
@@ -94,33 +102,30 @@ class Model:
             sc = (qr @ ka.T) * (HD**-0.5); sc -= np.max(sc, -1, keepdims=True)
             an = np.exp(sc) / np.sum(np.exp(sc), -1, keepdims=True)
             ao = (an @ va).astype(np.float16).ravel()
-            ap = self.dev.malloc(H*2); self.dev.h2d(ap, ao)  # ← O PROJ FIX
-            op = self.dev.exec("mm_1_1536_1536", [(ap, H*2), (self.g(i,"self_attn.o_proj.weight"), H*QD*2)])[0]
-            self.dev.free(ap)
-            ar = self.dev.exec("ops_add", [(hp, H*2), (op, H*2)])[0]
-            self.dev.d2d(hp, ar, H*2); self.dev.free(ar); self.dev.free(op)
-            pw = np.empty(H, dtype=np.float16); self.dev.d2h(pw, self.g(i,"post_attention_layernorm.weight"))
-            h2 = np.empty(H, dtype=np.float16); self.dev.d2h(h2, hp)
+            dev.h2d(hnp, ao)
+            op = dev.exec("mm_1_1536_1536", [(hnp, H*2), (self.g(i,"self_attn.o_proj.weight"), H*QD*2)])[0]
+            ar = dev.exec("ops_add", [(hp, H*2), (op, H*2)])[0]
+            dev.d2d(hp, ar, H*2); dev.free(ar); dev.free(op)
+            pw = np.empty(H, dtype=np.float16); dev.d2h(pw, self.g(i,"post_attention_layernorm.weight"))
+            h2 = np.empty(H, dtype=np.float16); dev.d2h(h2, hp)
             h2n = self.rms(h2, pw)
-            h2p = self.dev.malloc(H*2); self.dev.h2d(h2p, h2n)
-            gp = self.dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.gate_proj.weight"), IM*H*2)])
-            up = self.dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.up_proj.weight"), IM*H*2)])
-            self.dev.free(h2p)
-            gg = np.empty(IM, dtype=np.float16); self.dev.d2h(gg, gp[0]); self.dev.free(gp[0])
-            uu = np.empty(IM, dtype=np.float16); self.dev.d2h(uu, up[0]); self.dev.free(up[0])
+            h2p = self.buf_hn2; dev.h2d(h2p, h2n)
+            gp = dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.gate_proj.weight"), IM*H*2)])
+            up = dev.exec("mm_1_1536_4608", [(h2p, H*2), (self.g(i,"mlp.up_proj.weight"), IM*H*2)])
+            gg = np.empty(IM, dtype=np.float16); dev.d2h(gg, gp[0]); dev.free(gp[0])
+            uu = np.empty(IM, dtype=np.float16); dev.d2h(uu, up[0]); dev.free(up[0])
             g32 = gg.astype(np.float32)
             gu = (g32 * (1.0/(1.0+np.exp(-g32))) * uu.astype(np.float32)).astype(np.float16)
             hi = IM//2
-            gup = self.dev.malloc(IM*2); self.dev.h2d(gup, gu)
+            gup = self.buf_gup; dev.h2d(gup, gu)
             dp = self.g(i, "mlp.down_proj.weight")
-            dd = self.dev.exec("mm_1_2304_1536", [(gup, hi*2), (dp, hi*H*2)])
-            d2 = self.dev.exec("mm_1_2304_1536", [(gup+hi*2, hi*2), (dp+hi*H*2, hi*H*2)])
-            self.dev.free(gup)
-            ds = self.dev.exec("ops_add", [(dd[0], H*2), (d2[0], H*2)])[0]
-            self.dev.free(dd[0]); self.dev.free(d2[0])
-            r2 = self.dev.exec("ops_add", [(hp, H*2), (ds, H*2)])[0]
-            self.dev.d2d(hp, r2, H*2); self.dev.free(ds); self.dev.free(r2)
-        ho = np.empty(H, dtype=np.float16); self.dev.d2h(ho, hp); self.dev.free(hp)
+            dd = dev.exec("mm_1_2304_1536", [(gup, hi*2), (dp, hi*H*2)])
+            d2 = dev.exec("mm_1_2304_1536", [(gup+hi*2, hi*2), (dp+hi*H*2, hi*H*2)])
+            ds = dev.exec("ops_add", [(dd[0], H*2), (d2[0], H*2)])[0]
+            dev.free(dd[0]); dev.free(d2[0])
+            r2 = dev.exec("ops_add", [(hp, H*2), (ds, H*2)])[0]
+            dev.d2d(hp, r2, H*2); dev.free(ds); dev.free(r2)
+        ho = np.empty(H, dtype=np.float16); dev.d2h(ho, hp)
         return ho
 
     def generate(self, input_ids, max_new=256, temp=0.1, callback=None):
