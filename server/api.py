@@ -233,6 +233,7 @@ def _handle(body, is_chat):
     if body.stream:
         q = asyncio.Queue()
         def run():
+            m.dev.set_device()  # ⚠ each thread needs ACL context!
             try: m.generate(ids, body.max_tokens, body.temperature, callback=lambda t,ti: q.put_nowait(("tok",t,ti)))
             except Exception as e: log.error(f"Error: {e}"); q.put_nowait(("err",str(e),0))
             q.put_nowait(("done",None,None))
